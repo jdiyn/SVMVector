@@ -21,14 +21,14 @@ SVMVector - Shared Virtual Memory Vector for Boost.Compute OpenCL
  Allocations are performed with boost::compute::svm_alloc / svm_free and
  automatically expand as needed.
  
-![ExampleCode](examplecode.png)
+![ExampleCode](images/examplecode.png)
 
 ## Dependencies:
  1. Ensure your project has boost compute headers as additional includes
  2. Ensure project includes cl directory
  3. Ensure opencl.lib included in your project
  
-![ConsoleOutput](testoutput.png)
+![ConsoleOutput](images/testoutput.png)
 
 
  Usage example:

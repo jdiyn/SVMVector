@@ -23,6 +23,7 @@
 #include <chrono>
 #include <boost/compute.hpp>
 #include "svm_vector.hpp"
+#include "struct_test.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -50,6 +51,7 @@ bool operator==(const float2_& a, const float2_& b) {
 // forward declarations
 void test_svm_vector(boost::compute::context& context, boost::compute::command_queue& queue);
 void compute_multistep_test(const boost::compute::context& context, boost::compute::command_queue& queue);
+void test_svm_struct(const boost::compute::context& context, boost::compute::command_queue& queue);
 
 
 /////// Main function ////////
@@ -75,12 +77,22 @@ int main() {
 
         // Run the gamut of example tests
         test_svm_vector(context, queue);
+        // Call struct testing
+        test_svm_struct(context, queue);
+
+        // performance testing
         compute_multistep_test(context, queue);
+
         // No error, hurray
+		// Wait for user input before closing the console
+        std::cout << "Press Enter to exit...";
+        std::cin.get();
         return 0;
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
+		std::cout << "Press Enter to exit...";
+        std::cin.get();
         return 1;
     }
 }
@@ -531,4 +543,90 @@ void compute_multistep_test(const boost::compute::context& context,
     printCompare("Buffer", buffer_time, "Host", host_time);
 
     std::cout << "=== End Multi-Step Stress Test ===\n\n";
+}
+
+
+void test_svm_struct(const boost::compute::context& context,
+    boost::compute::command_queue& queue)
+{
+    using namespace boost::compute;
+
+    std::cout << "\n=== Verifying SVMVector<struct> in a kernel ===\n";
+    std::cout << "(Alignment, element access and retrieval, trivial types (int, float, float4).\n"
+        << "User can alter kernel to test your own non - trivial types)\n";
+
+    // build kernel
+    program prog = program::build_with_source(SVM_STRUCT_KERNEL_SRC, context);
+    kernel k = prog.create_kernel("StructKernel");
+
+    // the fun bit - create an SVMVector with the T being a struct
+    const int N = 8; // number of elemenets we'll use
+    SVMVector<TestStruct> vec(context, queue, N, true); // debug on
+    vec.resize(N); // always important to do this! see svm_vector for explanation
+
+    std::cout << "Struct setup:\n";
+    std::cout << "sizeof(TestStruct): " << sizeof(TestStruct) << "\n";
+    std::cout << "alignof(TestStruct): " << alignof(TestStruct) << "\n";
+    std::cout << "offset of dims: " << offsetof(TestStruct, dims) << "\n";
+
+
+    // Jam some data into the vector
+    // Directly written by host, and since no device usage should be no concurrency issues (or need for device being/end)
+    TestStruct* ptr = static_cast<TestStruct*>(vec.get_svm_pointer()); // set up an easy alias to the struct
+    for (int_ i = 0; i < N; i++) {
+        ptr[i].type = i;
+        ptr[i].radius = (float_)(i * 10.0f);
+        ptr[i].dims = float4_{ (float_)i, (float_)(2 * i), (float_)(3 * i), (float_)(4 * i) };
+    }
+   
+    // check it's all there
+    std::cout << "Host data BEFORE kernel:\n";
+    //TestStruct* ptr = static_cast<TestStruct*>(vec.get_svm_pointer());
+    for (int i = 0; i < N; i++) {
+        std::cout << " i=" << i
+            << "  type=" << ptr[i].type
+            << "  radius=" << ptr[i].radius
+            << "  dims=(" << ptr[i].dims.x << "," << ptr[i].dims.y << "," << ptr[i].dims.z << "," << ptr[i].dims.w << ")\n";
+    }
+
+    // get the kernel arguments with SVM pointer ready
+    k.set_arg_svm_ptr(0, vec.get_svm_pointer()); // struct input
+    k.set_arg(1, N);                            // int N (so this kernel knows the size and doesn't spawn threads out of bounds)
+    k.set_arg(2, 1);                            // value of 1 for debug outputs
+
+    // Since device usage, guard with device_begin_use/device_end_use()
+    std::cout << "Launching Struct-Testing Kernel...\n";
+    vec.device_begin_use();
+    queue.enqueue_1d_range_kernel(k, 0, N, 0); // jam it in the queue
+    queue.finish();
+    vec.device_end_use();
+
+    // Show that host has direct access to data AFTER kernel. No copyback/remap
+    // Notice: the radius should have been incremented by 1.0 (if using the kernel example given)
+    std::cout << "\nHost data AFTER kernel:\n";
+    
+    //TestStruct* ptr = static_cast<TestStruct*>(vec.get_svm_pointer());
+    for (int i = 0; i < N; i++) {
+        std::cout << " i=" << i
+            << "  type=" << ptr[i].type
+            << "  radius=" << ptr[i].radius
+            << "  dims=(" << ptr[i].dims.x << "," << ptr[i].dims.y << "," << ptr[i].dims.z << "," << ptr[i].dims.w << ")\n";
+    }
+    
+
+    // Sanity check - this is important if you're having data errors - its 99% likely it's a misalignment issue
+    // if so, might need to explicitly introduce padding into the kernel (tested without padding and just attribute setting
+    // on an older AMD gpu
+    //TestStruct* ptr = static_cast<TestStruct*>(vec.get_svm_pointer());
+    for (int i = 0; i < N; i++) {
+        // radius should have been incremented by 1 in the kernel
+        float expected = (float)(i * 10.0f + 1.0f);
+        if (std::fabs(ptr[i].radius - expected) > 1e-6f) {
+            std::cerr << "ERROR: idx=" << i << " radius mismatch => "
+                << ptr[i].radius << " (expected " << expected << ")\n";
+            std::cerr << "Possibly the error lies with misalignment of struct -  check the code. Your device may need explicit padding.\n";
+        }
+    }
+    std::cout << "\nIncrease of correct elements (radius) successful. No mismatch!\n";
+    std::cout << "=== Kernel struct testing completed ===\n\n";
 }

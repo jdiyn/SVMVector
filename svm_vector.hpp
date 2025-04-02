@@ -133,8 +133,8 @@ int main()
 #include <memory>
 #include <condition_variable>
 #include <atomic>
-#include <cmath>        
-#include <type_traits>
+#include <cmath>
+//#include <type_traits>
 
 namespace boost {
 namespace compute {
@@ -202,9 +202,6 @@ struct is_device_iterator<svm_device_iterator<T>> : boost::true_type {};
 //////////////////////////////////////////// Main Class ////////////////////////////////////////////////////////////
 template <typename T>
 class SVMVector {
-    // check if trivially copyable.. could remove this, but would require some code to handle non-trivial types well
-    static_assert(std::is_trivially_copyable<T>::value, "SVMVector requires T to be trivially copyable.");
-
   public:
     // Constructor
     SVMVector(const compute::context& context,
@@ -318,33 +315,46 @@ class SVMVector {
     // Is vector empty?
     bool empty() const { return (m_size.load(std::memory_order_relaxed) == 0); }
 
-    // vector like construct a new element at the end
+    // construct a new element at the end just like vector approich
+    // but need to ensure we can handle non trivial, so call the safe reallocation if
+    // need to increase capacity
     void push_back(const T& value) {
         std::unique_lock<std::mutex> lock(m_mutex);
         wait_until_device_not_in_use(lock);
 
         size_t curr_size = m_size.load(std::memory_order_relaxed);
         size_t curr_capacity = m_capacity.load(std::memory_order_relaxed);
-        // error check so as not to overflow
-        if (curr_capacity > (std::numeric_limits<size_t>::max() / m_growth_factor)) {
-            throw std::runtime_error("Capacity overflow in push_back");
-        }
 
+        // if at capacity, reallocate safely
         if (curr_size >= curr_capacity) {
             size_t new_capacity = static_cast<size_t>(std::ceil(curr_capacity * m_growth_factor));
+            if (new_capacity < curr_size + 1) {
+                new_capacity = curr_size + 1;
+            }
             reserve_internal(new_capacity);
-            curr_capacity = m_capacity.load(std::memory_order_relaxed);
         }
 
-        // Placement-new the object in place
-        new (&(get_data_ptr()[curr_size])) T(value);
-
+        // now we have space to jam in the new data element
+        T* data_ptr = static_cast<T*>(m_data.get());
+        try {
+            new (&data_ptr[curr_size]) T(value);
+        }
+        catch (...) {
+            // If T has a constructor whjch throws, do not change m_size,
+            // so container remains consistent. Instead, rethrow
+            throw;
+        }
+        // should be safe at this point
         m_size.store(curr_size + 1, std::memory_order_relaxed);
 
         if (m_debug) {
-            std::cout << "[DEBUG] push_back: new size = " << (curr_size + 1) << std::endl;
+            std::cout << "[DEBUG] push_back => new size = " << (curr_size + 1) << std::endl;
         }
     }
+
+    
+
+
 
     // vector like pop the last element
     void pop_back() {
@@ -366,9 +376,47 @@ class SVMVector {
         }
     }
 
+    // emplace_back provides the optino to construct a new element in-place (fwding args)
+    // best for move only or expensive copy types. If reallocation arises it'll do a safe approach
+    // that follows the same commit or rollback to handle safely/gracefully. 
+    // Just like the reserve internal - if the constructor throws, no changes are made to the container (size remains unchanged).
+    template <typename... Args>
+    void emplace_back(Args&&... args) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        wait_until_device_not_in_use(lock);
+
+        size_t curr_size = m_size.load(std::memory_order_relaxed);
+        size_t curr_capacity = m_capacity.load(std::memory_order_relaxed);
+
+        if (curr_size >= curr_capacity) {
+            size_t new_capacity = static_cast<size_t>(std::ceil(curr_capacity * m_growth_factor));
+            if (new_capacity < curr_size + 1) {
+                new_capacity = curr_size + 1;
+            }
+            reserve_internal(new_capacity); // uses the exception-safe reallocation logic
+        }
+
+        T* data_ptr = static_cast<T*>(m_data.get());
+        try {
+            // In-place construction using perfect forwarding:
+            new (&data_ptr[curr_size]) T(std::forward<Args>(args)...);
+        }
+        catch (...) {
+            // If constructor of T throws, we rethrow. m_size is not incremented,
+            // so the container remains consistent.
+            throw;
+        }
+
+        m_size.store(curr_size + 1, std::memory_order_relaxed);
+
+        if (m_debug) {
+            std::cout << "[DEBUG] emplace_back => size=" << (curr_size + 1) << std::endl;
+        }
+    }
+
+
     // at() => with bounds checking
     // note: this locks internally to ensure the device isn’t in use. This can result in significant o/head or slow down
-    // if safely done, a faster way to access is to ensure the device is not in use, and instead access raw pointers.
     T& at(size_t index) {
         std::unique_lock<std::mutex> lock(m_mutex);
         wait_until_device_not_in_use(lock);
@@ -459,6 +507,7 @@ class SVMVector {
             curr_capacity = m_capacity.load(std::memory_order_relaxed);
         }
 
+        // coudl try catch this if necessary for strong guarantees with non trivial T's.. not necessary though
         T* data_ptr = get_data_ptr();
         if (new_size > curr_size) {
             // Construct new objects [curr_size..new_size)
@@ -494,7 +543,8 @@ class SVMVector {
         }
     }
 
-    // assign from a range
+    // assign from a range - not strong guarantee, so if partialy constructed, wont get corrupt (i think)
+    // won't be able to fall back though... so avoid this if you're worried about partial construction/concurrency issues
     template <typename InputIterator>
     void assign(InputIterator first, InputIterator last) {
         using ValueType = typename std::iterator_traits<InputIterator>::value_type;
@@ -519,7 +569,8 @@ class SVMVector {
         for (auto it = first; it != last; ++it) {
             if (idx < curr_size) {
                 data_ptr[idx] = *it;
-            } else {
+            }
+            else {
                 // Need to placement-new
                 new (&data_ptr[idx]) T(*it);
             }
@@ -534,6 +585,8 @@ class SVMVector {
             std::cout << "[DEBUG] assign: new size = " << new_size << std::endl;
         }
     }
+
+
     // updates the vector’s data without locking its own mutex. This assumes the caller has already ensured exclusive access
     template <typename InputIterator, typename Converter>
     void assign_from_no_lock(InputIterator first, InputIterator last, Converter converter) {
@@ -735,79 +788,90 @@ class SVMVector {
     }
 
     // reserve internal space
-    void reserve_internal(size_t new_capacity) {
+    // if T constructor or move operator throws, maintain container in the old, valid state (instead of
+    // undefined or corrupt)
+    void reserve_internal(size_t new_capacity)
+    {
+        // Early exit if we don't actually need to grow
         size_t old_capacity = m_capacity.load(std::memory_order_relaxed);
-        if (new_capacity <= old_capacity)
+        if (new_capacity <= old_capacity) {
             return;
+        }
 
         if (m_debug) {
             std::cout << "[DEBUG] reserve_internal: old_capacity = " << old_capacity
-                      << ", new_capacity = " << new_capacity << std::endl;
+                << ", new_capacity = " << new_capacity << std::endl;
         }
 
+        // allocate new memory
         compute::svm_ptr<T> new_data;
         try {
-            new_data =
-                compute::svm_alloc<T>(*m_context, new_capacity, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER);  // if the device istn' fine grain supportive, this entire class will fail.
-        } catch (...) {
+            new_data = compute::svm_alloc<T>(*m_context, new_capacity,
+                CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER);
+        }
+        catch (...) {
             if (m_debug) {
-                std::cerr << "[DEBUG] Failed to allocate new SVM memory in reserve_internal." << std::endl;
+                std::cerr << "[DEBUG] Exception in svm_alloc during reserve_internal." << std::endl;
             }
-            throw;
+            throw; // rethrow
         }
 
         if (!new_data.get()) {
-            if (m_debug)
-                std::cerr << "[DEBUG] Alloc returned null. Trying fallback." << std::endl;
-
-            // fallback approach
-            size_t fallback_capacity = (old_capacity + new_capacity) / 2; // halfway attempt to be graceful before failure
-            if (fallback_capacity > old_capacity) {
-                try {
-                    new_data = compute::svm_alloc<T>(*m_context, fallback_capacity,
-                                                     CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER);
-                } catch (...) {
-                    if (m_debug) {
-                        std::cerr << "[DEBUG] Fallback also failed." << std::endl;
-                    }
-                    throw;
-                }
-                if (new_data.get()) {
-                    new_capacity = fallback_capacity;
-                } else {
-                    throw std::runtime_error("Failed to allocate fallback in reserve_internal()");
-                }
-            } else {
-                throw std::runtime_error("Failed to expand capacity");
-            }
+            throw std::runtime_error("Failed to allocate SVM memory in reserve_internal");
         }
 
+        // now move/copy existing elements to a new array (or at least try anyway, safely)
         size_t curr_size = m_size.load(std::memory_order_relaxed);
-
         T* old_ptr = static_cast<T*>(m_data.get());
         T* new_ptr = static_cast<T*>(new_data.get());
 
+        size_t constructed = 0; // track how many new elements constructed
+        try {
+            // If T is trivially copyable, we can do memcpy - which is much simpler
+            // If not trivial, need a loop with move-construct
+            if constexpr (std::is_trivially_copyable<T>::value) {
+                std::memcpy(new_ptr, old_ptr, curr_size * sizeof(T));
+                constructed = curr_size; // everything is "constructed"
+            }
+            else {
+                for (size_t i = 0; i < curr_size; i++) {
+                    new (&new_ptr[i]) T(std::move(old_ptr[i])); // may throw
+                    constructed++;
+                }
+            }
+        }
+        catch (...) {
+            // roll back the partial construction in new array
+            if constexpr (!std::is_trivially_copyable<T>::value) {
+                for (size_t j = 0; j < constructed; j++) {
+                    new_ptr[j].~T();
+                }
+            }
+            // free the new buffer
+            compute::svm_free(*m_context, new_data);
 
-        // If T is trivially copyable then memcpy (possible exapnsion here if using non trivial,
-        // but there's a compile time check at the beginnign to restrict T. Worth keeping for future use
-        if constexpr (std::is_trivially_copyable<T>::value) {
-            std::memcpy(new_ptr, old_ptr, curr_size * sizeof(T));
-        } else {
-            // do a move-construct each element, then destroy old
+            if (m_debug) {
+                std::cerr << "[DEBUG] Reallocation rollback due to exception.\n";
+            }
+            throw; // rethrow the original exception cause there's an issue
+        }
+
+        // destroy old array
+        if constexpr (!std::is_trivially_destructible<T>::value) {
             for (size_t i = 0; i < curr_size; i++) {
-                new (&new_ptr[i]) T(std::move(old_ptr[i]));
                 old_ptr[i].~T();
             }
         }
-
         // free old memory
         compute::svm_free(*m_context, m_data);
 
+        // now swap in the new array
         m_data = new_data;
         m_capacity.store(new_capacity, std::memory_order_relaxed);
 
         if (m_debug) {
-            std::cout << "[DEBUG] reserve_internal: new capacity = " << new_capacity << std::endl;
+            std::cout << "[DEBUG] reserve_internal => success, new capacity = "
+                << new_capacity << std::endl;
         }
     }
 
