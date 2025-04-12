@@ -493,6 +493,16 @@ class SVMVector {
         }
     }
 
+    // fill evey element with input T value
+    void fill(const T& value) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        wait_until_device_not_in_use(lock);
+
+        T* data_ptr = get_data_ptr();
+        size_t curr_size = m_size.load(std::memory_order_relaxed);
+        std::fill(data_ptr, data_ptr + curr_size, value);
+    }
+
     // resize => if new_size>old => default-construct new elements
     //           if new_size<old => destruct old elements
     void resize(size_t new_size) {

@@ -249,9 +249,24 @@ void test_svm_vector(boost::compute::context& context, boost::compute::command_q
             std::cout << "  - Move assignment works, moved element: " << vec3.at(0) << "\n";
         }
 
+        std::cout << "Test 9: Fill Test\n";
+        {
+            boost::compute::SVMVector<cl_float4> vec(context, queue, 10);
+            vec.resize(5); // Set size to 5, default-constructed elements
+
+            // Initialise cl_float4 ... small steps to move away from boost compute dependency
+            cl_float4 fill_value = { {42.0f, 43.1f, 44.2f, 45.3f} }; // Using array for s[0] to s[3]
+            vec.fill(fill_value); // Fill all 5 elements with the one cl_float4 (eg. can be used to just zero-initialise all elements if you want)
+
+            for (size_t i = 0; i < vec.size(); ++i) {
+                std::cout << "Element " << i << ": " << vec.at(i).w << ", " << vec.at(i).x << ", " << vec.at(i).y << ", " << vec.at(i).z << std::endl;
+                // Should get: Element 0: (42, 43.1, 44.2, 45.3)
+                //          Element 1: (42, 43.1, 44.2, 45.3) etc.
+            }
+        }
 
         // Test clearing and cleanup
-        std::cout << "Test 9: Clear\n";
+        std::cout << "Test 10: Clear\n";
         {
             boost::compute::SVMVector<float2_> vec(context, queue, 5);
             vec.push_back(float2_(1.0f, 2.0f));
